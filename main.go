@@ -77,7 +77,7 @@ func main() {
 	go SubscribeTimeline(config.Source)
 
 	port := ":8000"
-	envport := os.Getenv("CCWORLD_AP_RELAY_PORT")
+	envport := os.Getenv("PORT")
 	if envport != "" {
 		port = ":" + envport
 	}
