@@ -169,6 +169,10 @@ func SubscribeTimeline(id string) {
 			continue
 		}
 
+		if event.Item == nil {
+			continue
+		}
+
 		if len(event.Item.ResourceID) == 0 {
 			log.Println("ResourceID is empty")
 			jsonPrint("Event", event)
