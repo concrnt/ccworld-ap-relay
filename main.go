@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -19,12 +20,18 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/pkg/errors"
 	"github.com/totegamma/httpsig"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 
 	apmiddleware "github.com/concrnt/ccworld-ap-bridge/middleware"
+	capstore "github.com/concrnt/ccworld-ap-bridge/store"
 	"github.com/concrnt/ccworld-ap-bridge/types"
-	"github.com/totegamma/concurrent/client"
+	"github.com/concrnt/ccworld-ap-bridge/world"
+	ccclient "github.com/totegamma/concurrent/client"
 	"github.com/totegamma/concurrent/core"
+	commitStore "github.com/totegamma/concurrent/x/store"
 )
 
 const (
@@ -37,9 +44,16 @@ type Config struct {
 	PublicKey    string   `yaml:"public_key"`
 	Destinations []string `yaml:"destinations"`
 	Source       string   `yaml:"source"`
+	ProxyPriv    string   `yaml:"proxy_priv"`
+	ProxyCCID    string   `yaml:"proxy_ccid"`
+	ProxyHost    string   `yaml:"proxy_host"`
+	Dsn          string   `yaml:"dsn"`
 }
 
 var config Config
+var client ccclient.Client
+var store *capstore.Store
+var domain string
 
 func main() {
 
@@ -57,6 +71,16 @@ func main() {
 	}
 
 	log.Println("Config Loaded! FQDN:", config.FQDN)
+
+	db, err := gorm.Open(postgres.Open(config.Dsn), &gorm.Config{
+		TranslateError: true,
+	})
+	if err != nil {
+		panic("failed to connect database")
+	}
+
+	client = ccclient.NewClient()
+	store = capstore.NewStore(db)
 
 	e := echo.New()
 	e.Use(middleware.Recover())
@@ -114,8 +138,6 @@ func SubscribeTimeline(id string) {
 
 	fmt.Println("Subscribed to", id)
 
-	ccc := client.NewClient()
-
 	pingTicker := time.NewTicker(10 * time.Second)
 	defer pingTicker.Stop()
 
@@ -147,11 +169,17 @@ func SubscribeTimeline(id string) {
 			continue
 		}
 
+		if len(event.Item.ResourceID) == 0 {
+			log.Println("ResourceID is empty")
+			jsonPrint("Event", event)
+			continue
+		}
+
 		if event.Item.ResourceID[0] != 'm' {
 			continue
 		}
 
-		entity, err := ccc.GetEntity(ctx, domain, event.Item.Owner, nil)
+		entity, err := client.GetEntity(ctx, domain, event.Item.Owner, nil)
 		if err != nil {
 			log.Println("GetEntity:", err)
 			continue
@@ -237,6 +265,323 @@ func Inbox(c echo.Context) error {
 		}
 
 		return c.JSON(http.StatusOK, echo.Map{"success": "Follow Accepted"})
+
+	case "Create":
+		createObject, ok := object.Object.(map[string]interface{})
+		if !ok {
+			log.Println("ap/service/inbox/create Invalid Create Object")
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
+		}
+		createType, ok := createObject["type"].(string)
+		if !ok {
+			log.Println("ap/service/inbox/create Invalid Create Object")
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
+		}
+		createID, ok := createObject["id"].(string)
+		if !ok {
+			log.Println("ap/service/inbox/create Invalid Create Object")
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
+		}
+		switch createType {
+		case "Note":
+			// check if the note is already exists
+			_, err := store.GetApObjectReferenceByCcObjectID(ctx, createID)
+			if err == nil {
+				// already exists
+				log.Println("ap/service/inbox/create note already exists")
+				return c.JSON(http.StatusOK, echo.Map{"error": "Note already exists"})
+			}
+
+			// preserve reference
+			err = store.CreateApObjectReference(ctx, types.ApObjectReference{
+				ApObjectID: createID,
+				CcObjectID: "",
+			})
+
+			if err != nil {
+				log.Println("ap/service/inbox/create CreateApObjectReference", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "CreateApObjectReference Error"})
+			}
+
+			person, err := FetchPerson(ctx, object.Actor)
+			if err != nil {
+				log.Println("ap/service/inbox/create FetchPerson", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
+			}
+
+			// convertObject
+			noteBytes, err := json.Marshal(createObject)
+			if err != nil {
+				log.Println("ap/service/inbox/create Marshal", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+			}
+
+			var note types.ApObject
+			err = json.Unmarshal(noteBytes, &note)
+			if err != nil {
+				log.Println("ap/service/inbox/create Unmarshal", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "Unmarshal Error"})
+			}
+
+			created, err := NoteToMessage(ctx, note, person, []string{config.Source})
+
+			// save reference
+			err = store.UpdateApObjectReference(ctx, types.ApObjectReference{
+				ApObjectID: createID,
+				CcObjectID: created.ID,
+			})
+			if err != nil {
+				log.Println("ap/service/inbox/create UpdateApObjectReference", err)
+			}
+
+			return c.JSON(http.StatusOK, echo.Map{"success": "Note Created"})
+		default:
+			// print request body
+			b, err := json.Marshal(object)
+			if err != nil {
+				log.Println("ap/service/inbox/create Marshal", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+			}
+			log.Println("Unhandled Create Object", string(b))
+			return c.JSON(http.StatusOK, echo.Map{"error": "Unhandled Create Object"})
+		}
+
+	case "Delete":
+		deleteObject, ok := object.Object.(map[string]interface{})
+		if !ok {
+			jsonPrint("Delete Object", object)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Delete Object"})
+		}
+		deleteID, ok := deleteObject["id"].(string)
+		if !ok {
+			jsonPrint("Delete Object", object)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Delete Object"})
+		}
+
+		deleteRef, err := store.GetApObjectReferenceByApObjectID(ctx, deleteID)
+		if err != nil {
+			log.Println("ap/service/inbox/delete GetApObjectReferenceByApObjectID", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "GetApObjectReferenceByApObjectID Error"})
+		}
+
+		doc := core.DeleteDocument{
+			DocumentBase: core.DocumentBase[any]{
+				Signer:   config.ProxyCCID,
+				Type:     "delete",
+				SignedAt: time.Now(),
+			},
+			Target: deleteRef.CcObjectID,
+		}
+
+		document, err := json.Marshal(doc)
+		if err != nil {
+			log.Println("ap/service/inbox/delete Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		signatureBytes, err := core.SignBytes(document, config.ProxyPriv)
+		if err != nil {
+			log.Println("ap/service/inbox/delete SignBytes", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "SignBytes Error"})
+		}
+
+		signature := hex.EncodeToString(signatureBytes)
+
+		opt := commitStore.CommitOption{
+			IsEphemeral: true,
+		}
+
+		option, err := json.Marshal(opt)
+		if err != nil {
+			log.Println("ap/service/inbox/delete Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		commitObj := core.Commit{
+			Document:  string(document),
+			Signature: string(signature),
+			Option:    string(option),
+		}
+
+		commit, err := json.Marshal(commitObj)
+		if err != nil {
+			log.Println("ap/service/inbox/delete Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		_, err = client.Commit(ctx, config.ProxyHost, string(commit), nil, nil)
+		if err != nil {
+			log.Println("ap/service/inbox/delete Commit", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Commit Error"})
+		}
+
+		err = store.DeleteApObjectReference(ctx, deleteRef.ApObjectID)
+		if err != nil {
+			log.Println("ap/service/inbox/delete DeleteApObjectReference", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "DeleteApObjectReference Error"})
+		}
+		return c.JSON(http.StatusOK, echo.Map{"success": "Note Deleted"})
+
+	case "Announce":
+		announceObject, ok := object.Object.(string)
+		if !ok {
+			log.Println("ap/service/inbox/announce Invalid Announce Object")
+			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Announce Object"})
+		}
+		// check if the note is already exists
+		_, err := store.GetApObjectReferenceByCcObjectID(ctx, object.ID)
+		if err == nil {
+			// already exists
+			log.Println("ap/service/inbox/announce note already exists")
+			return c.JSON(http.StatusOK, echo.Map{"error": "Note already exists"})
+		}
+
+		// preserve reference
+		err = store.CreateApObjectReference(ctx, types.ApObjectReference{
+			ApObjectID: object.ID,
+			CcObjectID: "",
+		})
+
+		if err != nil {
+			log.Println("ap/service/inbox/announce CreateApObjectReference", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "CreateApObjectReference Error"})
+		}
+
+		person, err := FetchPerson(ctx, object.Actor)
+		if err != nil {
+			log.Println("ap/service/inbox/announce FetchPerson", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
+		}
+
+		var sourceMessage core.Message
+
+		// import note
+		existing, err := store.GetApObjectReferenceByApObjectID(ctx, announceObject)
+		if err == nil {
+			message, err := client.GetMessage(ctx, config.ProxyHost, existing.CcObjectID, nil)
+			if err == nil {
+				sourceMessage = message
+			}
+			log.Println("message not found: ", existing.CcObjectID, err)
+			store.DeleteApObjectReference(ctx, announceObject)
+		} else {
+			// fetch note
+			note, err := FetchNote(ctx, announceObject)
+			if err != nil {
+				log.Println("ap/service/inbox/announce FetchNote", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "FetchNote Error"})
+			}
+
+			// save person
+			person, err := FetchPerson(ctx, note.AttributedTo)
+			if err != nil {
+				log.Println("ap/service/inbox/announce FetchPerson", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
+			}
+
+			// save note as concurrent message
+			sourceMessage, err = NoteToMessage(ctx, note, person, []string{world.UserHomeStream + "@" + config.ProxyCCID})
+			if err != nil {
+				log.Println("ap/service/inbox/announce NoteToMessage", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "NoteToMessage Error"})
+			}
+
+			// save reference
+			err = store.CreateApObjectReference(ctx, types.ApObjectReference{
+				ApObjectID: announceObject,
+				CcObjectID: sourceMessage.ID,
+			})
+			if err != nil {
+				log.Println("ap/service/inbox/announce CreateApObjectReference", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "CreateApObjectReference Error"})
+			}
+		}
+
+		username := person.Name
+		if len(username) == 0 {
+			username = person.PreferredUsername
+		}
+
+		doc := core.MessageDocument[world.RerouteMessage]{
+			DocumentBase: core.DocumentBase[world.RerouteMessage]{
+				Signer:   config.ProxyCCID,
+				Type:     "message",
+				Schema:   world.RerouteMessageSchema,
+				SignedAt: time.Now(),
+				Body: world.RerouteMessage{
+					RerouteMessageID:     sourceMessage.ID,
+					RerouteMessageAuthor: sourceMessage.Author,
+					Body:                 object.Content,
+					ProfileOverride: &world.ProfileOverride{
+						Username:    username,
+						Avatar:      person.Icon.URL,
+						Description: person.Summary,
+						Link:        person.URL,
+					},
+				},
+				Meta: map[string]interface{}{
+					"apActor":          person.URL,
+					"apObject":         object.ID,
+					"apPublisherInbox": person.Inbox,
+				},
+			},
+			Timelines: []string{config.Source},
+		}
+
+		document, err := json.Marshal(doc)
+		if err != nil {
+			log.Println("ap/service/inbox/announce Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		signatureBytes, err := core.SignBytes(document, config.ProxyPriv)
+		if err != nil {
+			log.Println("ap/service/inbox/announce SignBytes", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "SignBytes Error"})
+		}
+
+		signature := hex.EncodeToString(signatureBytes)
+
+		opt := commitStore.CommitOption{
+			IsEphemeral: true,
+		}
+
+		option, err := json.Marshal(opt)
+		if err != nil {
+			log.Println("ap/service/inbox/announce Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		commitObj := core.Commit{
+			Document:  string(document),
+			Signature: string(signature),
+			Option:    string(option),
+		}
+
+		commit, err := json.Marshal(commitObj)
+		if err != nil {
+			log.Println("ap/service/inbox/announce Marshal", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
+		}
+
+		var created core.ResponseBase[core.Message]
+		_, err = client.Commit(ctx, config.ProxyHost, string(commit), &created, nil)
+		if err != nil {
+			log.Println("ap/service/inbox/announce Commit", err)
+			return c.JSON(http.StatusOK, echo.Map{"error": "Commit Error"})
+		}
+
+		// save reference
+		err = store.UpdateApObjectReference(ctx, types.ApObjectReference{
+			ApObjectID: object.ID,
+			CcObjectID: created.Content.ID,
+		})
+
+		if err != nil {
+			log.Println("ap/service/inbox/announce UpdateApObjectReference", err)
+		}
+
+		return c.JSON(http.StatusOK, echo.Map{"success": "Announce Created"})
 
 	default:
 		// print request body
@@ -398,4 +743,304 @@ func AcctRelay(c echo.Context) error {
 			PublicKeyPem: config.PublicKey,
 		},
 	})
+}
+
+func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApObject, destStreams []string) (core.Message, error) {
+
+	content := object.Content
+
+	tags, err := types.ParseTags(object.Tag)
+	if err != nil {
+		tags = []types.Tag{}
+	}
+
+	var emojis map[string]world.Emoji = make(map[string]world.Emoji)
+	for _, tag := range tags {
+		if tag.Type == "Emoji" {
+			name := strings.Trim(tag.Name, ":")
+			emojis[name] = world.Emoji{
+				ImageURL: tag.Icon.URL,
+			}
+		}
+	}
+
+	if len(content) == 0 {
+		return core.Message{}, errors.New("empty note")
+	}
+
+	if len(content) > 4096 {
+		return core.Message{}, errors.New("note too long")
+	}
+
+	contentWithImage := content
+	for _, attachment := range object.Attachment {
+		if attachment.Type == "Document" {
+			contentWithImage += "\n\n![image](" + attachment.URL + ")"
+		}
+	}
+
+	if object.Sensitive {
+		summary := "CW"
+		if object.Summary != "" {
+			summary = object.Summary
+		}
+		content = "<details>\n<summary>" + summary + "</summary>\n" + content + "\n</details>"
+		contentWithImage = "<details>\n<summary>" + summary + "</summary>\n" + contentWithImage + "\n</details>"
+	}
+
+	username := person.Name
+	if len(username) == 0 {
+		username = person.PreferredUsername
+	}
+
+	date, err := time.Parse(time.RFC3339Nano, object.Published)
+	if err != nil {
+		date = time.Now()
+	}
+
+	to := []string{}
+	toStr, ok := object.To.(string)
+	if ok {
+		to = append(to, toStr)
+	} else {
+		arr, ok := object.To.([]any)
+		if !ok {
+			return core.Message{}, errors.New("invalid to")
+		}
+		for _, v := range arr {
+			vStr, ok := v.(string)
+			if !ok {
+				fmt.Println("invalid to", v)
+				continue
+			}
+			to = append(to, vStr)
+		}
+	}
+
+	cc := []string{}
+	ccStr, ok := object.CC.(string)
+	if ok {
+		cc = append(cc, ccStr)
+	} else {
+		arr, ok := object.CC.([]any)
+		if !ok {
+			return core.Message{}, errors.New("invalid cc")
+		}
+		for _, v := range arr {
+			vStr, ok := v.(string)
+			if !ok {
+				fmt.Println("invalid cc", v)
+				continue
+			}
+			cc = append(cc, vStr)
+		}
+	}
+
+	var policy = ""
+	var policyParams = ""
+
+	var document []byte
+	if object.InReplyTo == "" {
+
+		media := []world.Media{}
+		for _, attachment := range object.Attachment {
+			flag := ""
+			if attachment.Sensitive || object.Sensitive {
+				flag = "sensitive"
+			}
+			media = append(media, world.Media{
+				MediaURL:  attachment.URL,
+				MediaType: attachment.MediaType,
+				Flag:      flag,
+			})
+		}
+
+		if len(object.Attachment) > 0 {
+			doc := core.MessageDocument[world.MediaMessage]{
+				DocumentBase: core.DocumentBase[world.MediaMessage]{
+					Signer: config.ProxyCCID,
+					Type:   "message",
+					Schema: world.MediaMessageSchema,
+					Body: world.MediaMessage{
+						Body: content,
+						ProfileOverride: &world.ProfileOverride{
+							Username:    username,
+							Avatar:      person.Icon.URL,
+							Description: person.Summary,
+							Link:        person.URL,
+						},
+						Medias: &media,
+						Emojis: &emojis,
+					},
+					Meta: map[string]interface{}{
+						"apActor":          person.URL,
+						"apObjectRef":      object.ID,
+						"apPublisherInbox": person.Inbox,
+					},
+					SignedAt:     date,
+					Policy:       policy,
+					PolicyParams: policyParams,
+				},
+				Timelines: destStreams,
+			}
+			document, err = json.Marshal(doc)
+			if err != nil {
+				return core.Message{}, errors.Wrap(err, "json marshal error")
+			}
+		} else {
+			doc := core.MessageDocument[world.MarkdownMessage]{
+				DocumentBase: core.DocumentBase[world.MarkdownMessage]{
+					Signer: config.ProxyCCID,
+					Type:   "message",
+					Schema: world.MarkdownMessageSchema,
+					Body: world.MarkdownMessage{
+						Body: content,
+						ProfileOverride: &world.ProfileOverride{
+							Username:    username,
+							Avatar:      person.Icon.URL,
+							Description: person.Summary,
+							Link:        person.URL,
+						},
+						Emojis: &emojis,
+					},
+					Meta: map[string]interface{}{
+						"apActor":          person.URL,
+						"apObjectRef":      object.ID,
+						"apPublisherInbox": person.Inbox,
+					},
+					SignedAt:     date,
+					Policy:       policy,
+					PolicyParams: policyParams,
+				},
+				Timelines: destStreams,
+			}
+			document, err = json.Marshal(doc)
+			if err != nil {
+				return core.Message{}, errors.Wrap(err, "json marshal error")
+			}
+		}
+
+	} else {
+
+		var ReplyToMessageID string
+		var ReplyToMessageAuthor string
+
+		if strings.HasPrefix(object.InReplyTo, "https://"+config.FQDN+"/ap/note/") {
+			replyToMessageID := strings.TrimPrefix(object.InReplyTo, "https://"+config.FQDN+"/ap/note/")
+			message, err := client.GetMessage(ctx, config.FQDN, replyToMessageID, nil)
+			if err != nil {
+				return core.Message{}, errors.Wrap(err, "message not found")
+			}
+			ReplyToMessageID = message.ID
+			ReplyToMessageAuthor = message.Author
+		} else {
+			ref, err := store.GetApObjectReferenceByApObjectID(ctx, object.InReplyTo)
+			if err != nil {
+				return core.Message{}, errors.Wrap(err, "object not found")
+			}
+			ReplyToMessageID = ref.CcObjectID
+			ReplyToMessageAuthor = config.ProxyCCID
+		}
+
+		doc := core.MessageDocument[world.ReplyMessage]{
+			DocumentBase: core.DocumentBase[world.ReplyMessage]{
+				Signer: config.ProxyCCID,
+				Type:   "message",
+				Schema: world.ReplyMessageSchema,
+				Body: world.ReplyMessage{
+					Body: contentWithImage,
+					ProfileOverride: &world.ProfileOverride{
+						Username:    username,
+						Avatar:      person.Icon.URL,
+						Description: person.Summary,
+						Link:        person.URL,
+					},
+					Emojis:               &emojis,
+					ReplyToMessageID:     ReplyToMessageID,
+					ReplyToMessageAuthor: ReplyToMessageAuthor,
+				},
+				Meta: map[string]interface{}{
+					"apActor":          person.URL,
+					"apObjectRef":      object.ID,
+					"apPublisherInbox": person.Inbox,
+				},
+				SignedAt:     date,
+				Policy:       policy,
+				PolicyParams: policyParams,
+			},
+			Timelines: destStreams,
+		}
+		document, err = json.Marshal(doc)
+		if err != nil {
+			return core.Message{}, errors.Wrap(err, "json marshal error")
+		}
+	}
+
+	signatureBytes, err := core.SignBytes(document, config.ProxyPriv)
+	if err != nil {
+		return core.Message{}, errors.Wrap(err, "sign error")
+	}
+
+	signature := hex.EncodeToString(signatureBytes)
+
+	opt := commitStore.CommitOption{
+		IsEphemeral: true,
+	}
+
+	option, err := json.Marshal(opt)
+	if err != nil {
+		return core.Message{}, errors.Wrap(err, "json marshal error")
+	}
+
+	commitObj := core.Commit{
+		Document:  string(document),
+		Signature: string(signature),
+		Option:    string(option),
+	}
+
+	commit, err := json.Marshal(commitObj)
+	if err != nil {
+		return core.Message{}, errors.Wrap(err, "json marshal error")
+	}
+
+	var created core.ResponseBase[core.Message]
+	_, err = client.Commit(ctx, config.ProxyHost, string(commit), &created, nil)
+	if err != nil {
+		return core.Message{}, err
+	}
+
+	return created.Content, nil
+}
+
+func FetchNote(ctx context.Context, noteID string) (types.ApObject, error) {
+
+	var note types.ApObject
+	req, err := http.NewRequest("GET", noteID, nil)
+	if err != nil {
+		return note, err
+	}
+
+	req.Header.Set("Accept", "application/activity+json")
+	req.Header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Host", req.URL.Host)
+	client := new(http.Client)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return note, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return note, err
+	}
+
+	err = json.Unmarshal(body, &note)
+	if err != nil {
+		return note, err
+	}
+
+	return note, nil
 }
