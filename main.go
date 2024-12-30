@@ -43,6 +43,8 @@ var config Config
 
 func main() {
 
+	log.Println("Starting ccworld-ap-relay")
+
 	f, err := os.Open("/etc/ccworld-ap-relay.yaml")
 	if err != nil {
 		panic(err)
@@ -53,6 +55,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	log.Println("Config Loaded! FQDN:", config.FQDN)
 
 	e := echo.New()
 	e.Use(middleware.Recover())
@@ -69,15 +73,17 @@ func main() {
 
 	e.POST("/inbox", Inbox)
 
+	log.Println("subscribing to", config.Source)
+	go SubscribeTimeline(config.Source)
+
 	port := ":8000"
 	envport := os.Getenv("CCWORLD_AP_RELAY_PORT")
 	if envport != "" {
 		port = ":" + envport
 	}
 
-	go SubscribeTimeline(config.Source)
-
-	e.Start(port)
+	log.Println("Starting server on", port)
+	e.Logger.Fatal(e.Start(port))
 }
 
 func SubscribeTimeline(id string) {
