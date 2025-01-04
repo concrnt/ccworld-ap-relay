@@ -128,7 +128,7 @@ func SubscribeTimeline(id string) {
 	c, _, err := dialer.Dial(u.String(), nil)
 	if err != nil {
 		log.Println("websocket.Dial:", err)
-		return
+		panic(err)
 	}
 
 	c.WriteJSON(map[string]interface{}{
@@ -146,7 +146,7 @@ func SubscribeTimeline(id string) {
 			err := c.WriteMessage(websocket.PingMessage, nil)
 			if err != nil {
 				log.Println("websocket.PingMessage:", err)
-				return
+				continue
 			}
 		}
 	}()
