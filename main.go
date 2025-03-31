@@ -22,6 +22,7 @@ import (
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/pkg/errors"
 	"github.com/totegamma/httpsig"
+	xhtml "golang.org/x/net/html"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 
@@ -232,17 +233,30 @@ func Announce(ctx context.Context, objectURL string) error {
 func Inbox(c echo.Context) error {
 	ctx := c.Request().Context()
 
-	var object types.ApObject
-	err := c.Bind(&object)
+	bytes, err := io.ReadAll(c.Request().Body)
 	if err != nil {
-		log.Printf("api/handler/inbox %v", err)
+		log.Println("api/handler/inbox io.ReadAll:", err)
 		return c.String(http.StatusBadRequest, "Invalid request body")
 	}
 
-	switch object.Type {
-	case "Follow":
+	object, err := types.LoadAsRawApObj(bytes)
+	if err != nil {
+		log.Println("api/handler/inbox LoadAsRawApObj:", err)
+		return c.String(http.StatusBadRequest, "Invalid request body")
+	}
 
-		requester, err := FetchPerson(ctx, object.Actor)
+	/*
+		var object types.ApObject
+		err := c.Bind(&object)
+		if err != nil {
+			log.Printf("api/handler/inbox %v", err)
+			return c.String(http.StatusBadRequest, "Invalid request body")
+		}
+	*/
+
+	switch object.MustGetString("type") {
+	case "Follow":
+		requester, err := FetchPerson(ctx, object.MustGetString("actor"))
 		if err != nil {
 			log.Println("ap/service/inbox/follow FetchPerson:", err)
 			return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
@@ -250,7 +264,7 @@ func Inbox(c echo.Context) error {
 
 		accept := types.ApObject{
 			Context: "https://www.w3.org/ns/activitystreams",
-			ID:      "https://" + config.FQDN + "/actor/follows/" + url.PathEscape(requester.ID),
+			ID:      "https://" + config.FQDN + "/actor/follows/" + url.PathEscape(requester.MustGetString("id")),
 			Type:    "Accept",
 			Actor:   "https://" + config.FQDN + "/actor",
 			Object:  object,
@@ -262,7 +276,7 @@ func Inbox(c echo.Context) error {
 			return c.JSON(http.StatusOK, echo.Map{"error": "json.Marshal Error"})
 		}
 
-		err = PostToInbox(ctx, requester.Inbox, acceptBytes)
+		err = PostToInbox(ctx, requester.MustGetString("inbox"), acceptBytes)
 		if err != nil {
 			log.Println("ap/service/inbox/follow PostToInbox:", err)
 			return c.JSON(http.StatusOK, echo.Map{"error": "PostToInbox Error"})
@@ -271,17 +285,17 @@ func Inbox(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{"success": "Follow Accepted"})
 
 	case "Create":
-		createObject, ok := object.Object.(map[string]any)
+		createObject, ok := object.GetRaw("object")
 		if !ok {
 			log.Println("ap/service/inbox/create Invalid Create Object")
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
 		}
-		createType, ok := createObject["type"].(string)
+		createType, ok := createObject.GetString("type")
 		if !ok {
 			log.Println("ap/service/inbox/create Invalid Create Object")
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
 		}
-		createID, ok := createObject["id"].(string)
+		createID, ok := createObject.GetString("id")
 		if !ok {
 			log.Println("ap/service/inbox/create Invalid Create Object")
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
@@ -307,7 +321,7 @@ func Inbox(c echo.Context) error {
 				return c.JSON(http.StatusOK, echo.Map{"error": "CreateApObjectReference Error"})
 			}
 
-			person, err := FetchPerson(ctx, object.Actor)
+			person, err := FetchPerson(ctx, object.MustGetString("actor"))
 			if err != nil {
 				log.Println("ap/service/inbox/create FetchPerson", err)
 				return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
@@ -320,14 +334,17 @@ func Inbox(c echo.Context) error {
 				return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
 			}
 
-			var note types.ApObject
-			err = json.Unmarshal(noteBytes, &note)
+			note, err := types.LoadAsRawApObj(noteBytes)
 			if err != nil {
-				log.Println("ap/service/inbox/create Unmarshal", err)
-				return c.JSON(http.StatusOK, echo.Map{"error": "Unmarshal Error"})
+				log.Println("ap/service/inbox/create LoadAsRawApObj", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "LoadAsRawApObj Error"})
 			}
 
 			created, err := NoteToMessage(ctx, note, person, []string{config.Source})
+			if err != nil {
+				log.Println("ap/service/inbox/create NoteToMessage", err)
+				return c.JSON(http.StatusOK, echo.Map{"error": "NoteToMessage Error"})
+			}
 
 			// save reference
 			err = store.UpdateApObjectReference(ctx, types.ApObjectReference{
@@ -351,12 +368,12 @@ func Inbox(c echo.Context) error {
 		}
 
 	case "Delete":
-		deleteObject, ok := object.Object.(map[string]any)
+		deleteObject, ok := object.GetRaw("object")
 		if !ok {
 			jsonPrint("Delete Object", object)
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Delete Object"})
 		}
-		deleteID, ok := deleteObject["id"].(string)
+		deleteID, ok := deleteObject.GetString("id")
 		if !ok {
 			jsonPrint("Delete Object", object)
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Delete Object"})
@@ -427,13 +444,13 @@ func Inbox(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{"success": "Note Deleted"})
 
 	case "Announce":
-		announceObject, ok := object.Object.(string)
+		announceObject, ok := object.GetString("object") //object.Object.(string)
 		if !ok {
 			log.Println("ap/service/inbox/announce Invalid Announce Object")
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Announce Object"})
 		}
 		// check if the note is already exists
-		_, err := store.GetApObjectReferenceByCcObjectID(ctx, object.ID)
+		_, err := store.GetApObjectReferenceByCcObjectID(ctx, object.MustGetString("id"))
 		if err == nil {
 			// already exists
 			log.Println("ap/service/inbox/announce note already exists")
@@ -442,7 +459,7 @@ func Inbox(c echo.Context) error {
 
 		// preserve reference
 		err = store.CreateApObjectReference(ctx, types.ApObjectReference{
-			ApObjectID: object.ID,
+			ApObjectID: object.MustGetString("id"),
 			CcObjectID: "",
 		})
 
@@ -451,7 +468,7 @@ func Inbox(c echo.Context) error {
 			return c.JSON(http.StatusOK, echo.Map{"error": "CreateApObjectReference Error"})
 		}
 
-		person, err := FetchPerson(ctx, object.Actor)
+		person, err := FetchPerson(ctx, object.MustGetString("actor"))
 		if err != nil {
 			log.Println("ap/service/inbox/announce FetchPerson", err)
 			return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
@@ -477,7 +494,7 @@ func Inbox(c echo.Context) error {
 			}
 
 			// save person
-			person, err := FetchPerson(ctx, note.AttributedTo)
+			person, err := FetchPerson(ctx, note.MustGetString("attributedTo"))
 			if err != nil {
 				log.Println("ap/service/inbox/announce FetchPerson", err)
 				return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
@@ -501,9 +518,9 @@ func Inbox(c echo.Context) error {
 			}
 		}
 
-		username := person.Name
+		username := person.MustGetString("name")
 		if len(username) == 0 {
-			username = person.PreferredUsername
+			username = person.MustGetString("preferredUsername")
 		}
 
 		doc := core.MessageDocument[world.RerouteMessage]{
@@ -515,18 +532,18 @@ func Inbox(c echo.Context) error {
 				Body: world.RerouteMessage{
 					RerouteMessageID:     sourceMessage.ID,
 					RerouteMessageAuthor: sourceMessage.Author,
-					Body:                 object.Content,
+					Body:                 object.MustGetString("content"),
 					ProfileOverride: &world.ProfileOverride{
 						Username:    username,
-						Avatar:      person.Icon.URL,
-						Description: person.Summary,
-						Link:        person.URL,
+						Avatar:      person.MustGetString("icon.url"),
+						Description: person.MustGetString("summary"),
+						Link:        person.MustGetString("actor"),
 					},
 				},
 				Meta: map[string]any{
-					"apActor":          person.URL,
-					"apObject":         object.ID,
-					"apPublisherInbox": person.Inbox,
+					"apActor":          person.MustGetString("url"),
+					"apObject":         object.MustGetString("id"),
+					"apPublisherInbox": person.MustGetString("inbox"),
 				},
 			},
 			Timelines: []string{config.Source},
@@ -577,7 +594,7 @@ func Inbox(c echo.Context) error {
 
 		// save reference
 		err = store.UpdateApObjectReference(ctx, types.ApObjectReference{
-			ApObjectID: object.ID,
+			ApObjectID: object.MustGetString("id"),
 			CcObjectID: created.Content.ID,
 		})
 
@@ -605,12 +622,11 @@ func jsonPrint(title string, v any) {
 	fmt.Println("--------------------------------")
 }
 
-func FetchPerson(ctx context.Context, actor string) (types.ApObject, error) {
+func FetchPerson(ctx context.Context, actor string) (*types.RawApObj, error) {
 
-	var person types.ApObject
 	req, err := http.NewRequest("GET", actor, nil)
 	if err != nil {
-		return person, err
+		return nil, err
 	}
 
 	req.Header.Set("Accept", "application/activity+json")
@@ -621,14 +637,15 @@ func FetchPerson(ctx context.Context, actor string) (types.ApObject, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return person, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
 
-	err = json.Unmarshal(body, &person)
+	person, err := types.LoadAsRawApObj(body)
 	if err != nil {
+		log.Println(err)
 		return person, err
 	}
 
@@ -749,21 +766,81 @@ func AcctRelay(c echo.Context) error {
 	})
 }
 
-func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApObject, destStreams []string) (core.Message, error) {
-
-	content := object.Content
-
-	tags, err := types.ParseTags(object.Tag)
+func htmlToMarkdown(r io.Reader) (string, error) {
+	doc, err := xhtml.Parse(r)
 	if err != nil {
-		tags = []types.Tag{}
+		return "", err
 	}
 
+	// traverse はノード n を受け取り、変換後の文字列を返す再帰関数です。
+	var traverse func(n *xhtml.Node) string
+	traverse = func(n *xhtml.Node) string {
+		var result strings.Builder
+
+		switch n.Type {
+		case xhtml.TextNode:
+			result.WriteString(n.Data)
+		case xhtml.ElementNode:
+			switch n.Data {
+			case "a":
+				var href string
+				for _, attr := range n.Attr {
+					if attr.Key == "href" {
+						href = attr.Val
+						break
+					}
+				}
+				result.WriteString("[")
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					result.WriteString(traverse(c))
+				}
+				result.WriteString(fmt.Sprintf("](%s)", href))
+			case "p":
+				result.WriteString("\n\n")
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					result.WriteString(traverse(c))
+				}
+			case "br":
+				result.WriteString("\n")
+			default:
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					result.WriteString(traverse(c))
+				}
+			}
+		default:
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				result.WriteString(traverse(c))
+			}
+		}
+		return result.String()
+	}
+
+	return traverse(doc), nil
+}
+
+func NoteToMessage(ctx context.Context, object *types.RawApObj, person *types.RawApObj, destStreams []string) (core.Message, error) {
+
+	content, ok := object.GetString("_misskey_content")
+	if !ok {
+		rawcontent := object.MustGetString("content")
+		if rawcontent != "" {
+			var err error
+			content, err = htmlToMarkdown(strings.NewReader(rawcontent))
+			if err != nil {
+				fmt.Println("html to markdown error", err)
+				content = rawcontent
+			}
+			content = strings.Trim(content, "\n")
+		}
+	}
+
+	tags, _ := object.GetRawSlice("tag")
 	var emojis map[string]world.Emoji = make(map[string]world.Emoji)
 	for _, tag := range tags {
-		if tag.Type == "Emoji" {
-			name := strings.Trim(tag.Name, ":")
+		if tag.MustGetString("type") == "Emoji" {
+			name := strings.Trim(tag.MustGetString("name"), ":")
 			emojis[name] = world.Emoji{
-				ImageURL: tag.Icon.URL,
+				ImageURL: tag.MustGetString("icon.url"),
 			}
 		}
 	}
@@ -777,89 +854,51 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 	}
 
 	contentWithImage := content
-	for _, attachment := range object.Attachment {
-		if attachment.Type == "Document" {
-			contentWithImage += "\n\n![image](" + attachment.URL + ")"
+	for _, attachment := range object.MustGetRawSlice("attachment") {
+		if attachment.MustGetString("type") == "document" {
+			contentWithImage += "\n\n![image](" + attachment.MustGetString("url") + ")"
 		}
 	}
 
-	if object.Sensitive {
+	if object.MustGetBool("sensitive") {
 		summary := "CW"
-		if object.Summary != "" {
-			summary = object.Summary
+		if object.MustGetString("summary") != "" {
+			summary = object.MustGetString("summary")
 		}
 		content = "<details>\n<summary>" + summary + "</summary>\n" + content + "\n</details>"
 		contentWithImage = "<details>\n<summary>" + summary + "</summary>\n" + contentWithImage + "\n</details>"
 	}
 
-	username := person.Name
+	username := person.MustGetString("name")
 	if len(username) == 0 {
-		username = person.PreferredUsername
+		username = person.MustGetString("preferredUsername")
 	}
 
-	date, err := time.Parse(time.RFC3339Nano, object.Published)
+	date, err := time.Parse(time.RFC3339, object.MustGetString("published"))
 	if err != nil {
 		date = time.Now()
-	}
-
-	to := []string{}
-	toStr, ok := object.To.(string)
-	if ok {
-		to = append(to, toStr)
-	} else {
-		arr, ok := object.To.([]any)
-		if !ok {
-			return core.Message{}, errors.New("invalid to")
-		}
-		for _, v := range arr {
-			vStr, ok := v.(string)
-			if !ok {
-				fmt.Println("invalid to", v)
-				continue
-			}
-			to = append(to, vStr)
-		}
-	}
-
-	cc := []string{}
-	ccStr, ok := object.CC.(string)
-	if ok {
-		cc = append(cc, ccStr)
-	} else {
-		arr, ok := object.CC.([]any)
-		if !ok {
-			return core.Message{}, errors.New("invalid cc")
-		}
-		for _, v := range arr {
-			vStr, ok := v.(string)
-			if !ok {
-				fmt.Println("invalid cc", v)
-				continue
-			}
-			cc = append(cc, vStr)
-		}
 	}
 
 	var policy = ""
 	var policyParams = ""
 
 	var document []byte
-	if object.InReplyTo == "" {
+	if object.MustGetString("inReplyTo") != "" {
 
 		media := []world.Media{}
-		for _, attachment := range object.Attachment {
+		for _, attachment := range object.MustGetRawSlice("attachment") {
 			flag := ""
-			if attachment.Sensitive || object.Sensitive {
+			if attachment.MustGetBool("sensitive") || object.MustGetBool("sensitive") {
 				flag = "sensitive"
 			}
 			media = append(media, world.Media{
-				MediaURL:  attachment.URL,
-				MediaType: attachment.MediaType,
+				MediaURL:  attachment.MustGetString("url"),
+				MediaType: attachment.MustGetString("mediaType"),
 				Flag:      flag,
 			})
 		}
 
-		if len(object.Attachment) > 0 {
+		if len(object.MustGetRawSlice("attachment")) > 0 {
 			doc := core.MessageDocument[world.MediaMessage]{
 				DocumentBase: core.DocumentBase[world.MediaMessage]{
 					Signer: config.ProxyCCID,
@@ -869,17 +908,17 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 						Body: content,
 						ProfileOverride: &world.ProfileOverride{
 							Username:    username,
-							Avatar:      person.Icon.URL,
-							Description: person.Summary,
-							Link:        person.URL,
+							Avatar:      person.MustGetString("icon.url"),
+							Description: person.MustGetString("summary"),
+							Link:        person.MustGetString("url"),
 						},
 						Medias: &media,
 						Emojis: &emojis,
 					},
 					Meta: map[string]any{
-						"apActor":          person.URL,
-						"apObjectRef":      object.ID,
-						"apPublisherInbox": person.Inbox,
+						"apActor":          person.MustGetString("url"),
+						"apObjectRef":      object.MustGetString("id"),
+						"apPublisherInbox": person.MustGetString("inbox"),
 					},
 					SignedAt:     date,
 					Policy:       policy,
@@ -901,16 +940,16 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 						Body: content,
 						ProfileOverride: &world.ProfileOverride{
 							Username:    username,
-							Avatar:      person.Icon.URL,
-							Description: person.Summary,
-							Link:        person.URL,
+							Avatar:      person.MustGetString("icon.url"),
+							Description: person.MustGetString("summary"),
+							Link:        person.MustGetString("url"),
 						},
 						Emojis: &emojis,
 					},
 					Meta: map[string]any{
-						"apActor":          person.URL,
-						"apObjectRef":      object.ID,
-						"apPublisherInbox": person.Inbox,
+						"apActor":          person.MustGetString("url"),
+						"apObjectRef":      object.MustGetString("id"),
+						"apPublisherInbox": person.MustGetString("inbox"),
 					},
 					SignedAt:     date,
 					Policy:       policy,
@@ -929,8 +968,8 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 		var ReplyToMessageID string
 		var ReplyToMessageAuthor string
 
-		if strings.HasPrefix(object.InReplyTo, "https://"+config.FQDN+"/ap/note/") {
-			replyToMessageID := strings.TrimPrefix(object.InReplyTo, "https://"+config.FQDN+"/ap/note/")
+		if strings.HasPrefix(object.MustGetString("inReplyTo"), "https://"+config.FQDN+"/ap/note/") {
+			replyToMessageID := strings.TrimPrefix(object.MustGetString("inReplyTo"), "https://"+config.FQDN+"/ap/note/")
 			message, err := client.GetMessage(ctx, config.FQDN, replyToMessageID, nil)
 			if err != nil {
 				return core.Message{}, errors.Wrap(err, "message not found")
@@ -938,7 +977,7 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 			ReplyToMessageID = message.ID
 			ReplyToMessageAuthor = message.Author
 		} else {
-			ref, err := store.GetApObjectReferenceByApObjectID(ctx, object.InReplyTo)
+			ref, err := store.GetApObjectReferenceByApObjectID(ctx, object.MustGetString("inReplyTo"))
 			if err != nil {
 				return core.Message{}, errors.Wrap(err, "object not found")
 			}
@@ -954,19 +993,18 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 				Body: world.ReplyMessage{
 					Body: contentWithImage,
 					ProfileOverride: &world.ProfileOverride{
-						Username:    username,
-						Avatar:      person.Icon.URL,
-						Description: person.Summary,
-						Link:        person.URL,
+						Avatar:      person.MustGetString("icon.url"),
+						Description: person.MustGetString("summary"),
+						Link:        person.MustGetString("url"),
 					},
 					Emojis:               &emojis,
 					ReplyToMessageID:     ReplyToMessageID,
 					ReplyToMessageAuthor: ReplyToMessageAuthor,
 				},
 				Meta: map[string]any{
-					"apActor":          person.URL,
-					"apObjectRef":      object.ID,
-					"apPublisherInbox": person.Inbox,
+					"apActor":          person.MustGetString("url"),
+					"apObjectRef":      object.MustGetString("id"),
+					"apPublisherInbox": person.MustGetString("inbox"),
 				},
 				SignedAt:     date,
 				Policy:       policy,
@@ -1016,12 +1054,11 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 	return created.Content, nil
 }
 
-func FetchNote(ctx context.Context, noteID string) (types.ApObject, error) {
+func FetchNote(ctx context.Context, noteID string) (*types.RawApObj, error) {
 
-	var note types.ApObject
 	req, err := http.NewRequest("GET", noteID, nil)
 	if err != nil {
-		return note, err
+		return nil, err
 	}
 
 	req.Header.Set("Accept", "application/activity+json")
@@ -1032,16 +1069,16 @@ func FetchNote(ctx context.Context, noteID string) (types.ApObject, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return note, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return note, err
+		return nil, err
 	}
 
-	err = json.Unmarshal(body, &note)
+	note, err := types.LoadAsRawApObj(body)
 	if err != nil {
 		return note, err
 	}

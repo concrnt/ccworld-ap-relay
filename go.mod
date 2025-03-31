@@ -3,12 +3,12 @@ module github.com/concrnt/ccworld-ap-relay
 go 1.22.5
 
 require (
-	github.com/concrnt/ccworld-ap-bridge v0.3.4
+	github.com/concrnt/ccworld-ap-bridge v0.5.1
 	github.com/go-yaml/yaml v2.1.0+incompatible
 	github.com/gorilla/websocket v1.5.3
 	github.com/labstack/echo/v4 v4.13.3
 	github.com/pkg/errors v0.9.1
-	github.com/totegamma/concurrent v1.6.3
+	github.com/totegamma/concurrent v1.6.11
 	github.com/totegamma/httpsig v1.1.1
 	gorm.io/driver/postgres v1.5.9
 	gorm.io/gorm v1.25.11
