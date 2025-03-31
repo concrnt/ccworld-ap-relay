@@ -131,7 +131,7 @@ func SubscribeTimeline(id string) {
 		panic(err)
 	}
 
-	c.WriteJSON(map[string]interface{}{
+	c.WriteJSON(map[string]any{
 		"type":     "listen",
 		"channels": []string{id},
 	})
@@ -271,7 +271,7 @@ func Inbox(c echo.Context) error {
 		return c.JSON(http.StatusOK, echo.Map{"success": "Follow Accepted"})
 
 	case "Create":
-		createObject, ok := object.Object.(map[string]interface{})
+		createObject, ok := object.Object.(map[string]any)
 		if !ok {
 			log.Println("ap/service/inbox/create Invalid Create Object")
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Create Object"})
@@ -351,7 +351,7 @@ func Inbox(c echo.Context) error {
 		}
 
 	case "Delete":
-		deleteObject, ok := object.Object.(map[string]interface{})
+		deleteObject, ok := object.Object.(map[string]any)
 		if !ok {
 			jsonPrint("Delete Object", object)
 			return c.JSON(http.StatusOK, echo.Map{"error": "Invalid Delete Object"})
@@ -523,7 +523,7 @@ func Inbox(c echo.Context) error {
 						Link:        person.URL,
 					},
 				},
-				Meta: map[string]interface{}{
+				Meta: map[string]any{
 					"apActor":          person.URL,
 					"apObject":         object.ID,
 					"apPublisherInbox": person.Inbox,
@@ -594,7 +594,7 @@ func Inbox(c echo.Context) error {
 	}
 }
 
-func jsonPrint(title string, v interface{}) {
+func jsonPrint(title string, v any) {
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		fmt.Println("error:", err)
@@ -876,7 +876,7 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 						Medias: &media,
 						Emojis: &emojis,
 					},
-					Meta: map[string]interface{}{
+					Meta: map[string]any{
 						"apActor":          person.URL,
 						"apObjectRef":      object.ID,
 						"apPublisherInbox": person.Inbox,
@@ -907,7 +907,7 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 						},
 						Emojis: &emojis,
 					},
-					Meta: map[string]interface{}{
+					Meta: map[string]any{
 						"apActor":          person.URL,
 						"apObjectRef":      object.ID,
 						"apPublisherInbox": person.Inbox,
@@ -963,7 +963,7 @@ func NoteToMessage(ctx context.Context, object types.ApObject, person types.ApOb
 					ReplyToMessageID:     ReplyToMessageID,
 					ReplyToMessageAuthor: ReplyToMessageAuthor,
 				},
-				Meta: map[string]interface{}{
+				Meta: map[string]any{
 					"apActor":          person.URL,
 					"apObjectRef":      object.ID,
 					"apPublisherInbox": person.Inbox,
