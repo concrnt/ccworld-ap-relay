@@ -245,15 +245,6 @@ func Inbox(c echo.Context) error {
 		return c.String(http.StatusBadRequest, "Invalid request body")
 	}
 
-	/*
-		var object types.ApObject
-		err := c.Bind(&object)
-		if err != nil {
-			log.Printf("api/handler/inbox %v", err)
-			return c.String(http.StatusBadRequest, "Invalid request body")
-		}
-	*/
-
 	switch object.MustGetString("type") {
 	case "Follow":
 		requester, err := FetchPerson(ctx, object.MustGetString("actor"))
@@ -327,20 +318,7 @@ func Inbox(c echo.Context) error {
 				return c.JSON(http.StatusOK, echo.Map{"error": "FetchPerson Error"})
 			}
 
-			// convertObject
-			noteBytes, err := json.Marshal(createObject)
-			if err != nil {
-				log.Println("ap/service/inbox/create Marshal", err)
-				return c.JSON(http.StatusOK, echo.Map{"error": "Marshal Error"})
-			}
-
-			note, err := types.LoadAsRawApObj(noteBytes)
-			if err != nil {
-				log.Println("ap/service/inbox/create LoadAsRawApObj", err)
-				return c.JSON(http.StatusOK, echo.Map{"error": "LoadAsRawApObj Error"})
-			}
-
-			created, err := NoteToMessage(ctx, note, person, []string{config.Source})
+			created, err := NoteToMessage(ctx, createObject, person, []string{config.Source})
 			if err != nil {
 				log.Println("ap/service/inbox/create NoteToMessage", err)
 				return c.JSON(http.StatusOK, echo.Map{"error": "NoteToMessage Error"})
