@@ -861,7 +861,7 @@ func NoteToMessage(ctx context.Context, object *types.RawApObj, person *types.Ra
 	var policyParams = ""
 
 	var document []byte
-	if object.MustGetString("inReplyTo") != "" {
+	if object.MustGetString("inReplyTo") == "" {
 
 		media := []world.Media{}
 		for _, attachment := range object.MustGetRawSlice("attachment") {
