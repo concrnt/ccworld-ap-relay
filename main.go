@@ -913,7 +913,7 @@ func NoteToMessage(ctx context.Context, object *types.RawApObj, person *types.Ra
 				DocumentBase: core.DocumentBase[world.MarkdownMessage]{
 					Signer: config.ProxyCCID,
 					Type:   "message",
-					Schema: world.MarkdownMessageSchema,
+					Schema: "https://schema.concrnt.world/m/mfm.json",
 					Body: world.MarkdownMessage{
 						Body: content,
 						ProfileOverride: &world.ProfileOverride{
